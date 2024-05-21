@@ -40,8 +40,13 @@ int main() {
   const int maxIter = 2000, printInterval = 1000;
   int h_nx = 420, h_ny = 180;
   float h_Re = 100;
-  dim3 threadSizingAll(h_nx, h_ny);
-  dim3 threadSizingJustY(1, h_ny);
+  dim3 threadSizingAll(3, 32, 1);
+  dim3 threadSizingAllDIM(3, 32, NUMDIM);
+  dim3 threadSizingAllDIR(3, 32, NUMDIR);
+  dim3 threadSizingJustY(1, 32, 1);
+  dim3 threadSizingJustY3(1, 32, 3);
+  dim3 blockSizingAll((h_nx - 1) / 3 + 1, (h_ny - 1) / 32 + 1, 1);
+  dim3 blockSizingJustY(1, (h_ny - 1) / 32 + 1, 1);
   set_nxy<<<1, 1>>>(h_nx, h_ny, h_Re);
   cudaDeviceSynchronize();
   const int f_size = NUMDIR * h_nx * h_ny * sizeof(float);
@@ -60,108 +65,120 @@ int main() {
   cudaMallocHost((float **)&h_u, u_size);
   cudaDeviceSynchronize();
 
-  obstacle_mask<<<threadSizingAll, 1>>>(d_obstacle);
+  obstacle_mask<<<blockSizingAll, threadSizingAll>>>(d_obstacle);
   cudaDeviceSynchronize();
 
-  inivel<<<threadSizingAll, NUMDIM>>>(d_u);
+  inivel<<<blockSizingAll, threadSizingAllDIM>>>(d_u);
   cudaDeviceSynchronize();
 
-  setRhoTo1f<<<threadSizingAll, 1>>>(d_rho);
+  setRhoTo1f<<<blockSizingAll, threadSizingAll>>>(d_rho);
   cudaDeviceSynchronize();
 
-  equilibrium<<<threadSizingAll, 1>>>(d_rho, d_u, d_fin);
+  equilibrium<<<blockSizingAll, threadSizingAll>>>(d_rho, d_u, d_fin);
   cudaDeviceSynchronize();
   for (int i = 1; i <= maxIter; ++i) {
-    std::cout << "Step: " << i << std::endl;
-    right_wall_outflow<<<threadSizingJustY, 3>>>(d_fin);
+    // std::cout << "Step: " << i << std::endl;
+    right_wall_outflow<<<blockSizingJustY, threadSizingJustY3>>>(d_fin);
     cudaDeviceSynchronize();
 
-    macroscopic<<<threadSizingAll, 1>>>(d_fin, d_rho, d_u);
+    macroscopic<<<blockSizingAll, threadSizingAll>>>(d_fin, d_rho, d_u);
     cudaDeviceSynchronize();
 
-    left_wall_inflow<<<threadSizingJustY, 1>>>(d_fin, d_rho, d_u);
+    left_wall_inflow<<<blockSizingJustY, threadSizingJustY>>>(d_fin, d_rho,
+                                                              d_u);
     cudaDeviceSynchronize();
 
-    equilibrium<<<threadSizingAll, 1>>>(d_rho, d_u, d_feq);
+    equilibrium<<<blockSizingAll, threadSizingAll>>>(d_rho, d_u, d_feq);
     cudaDeviceSynchronize();
 
-    equilibrium_to_fin<<<threadSizingJustY, 3>>>(d_feq, d_fin);
+    equilibrium_to_fin<<<blockSizingJustY, threadSizingJustY3>>>(d_feq, d_fin);
     cudaDeviceSynchronize();
 
-    collision<<<threadSizingAll, NUMDIR>>>(d_fin, d_feq, d_fout);
+    collision<<<blockSizingAll, threadSizingAllDIR>>>(d_fin, d_feq, d_fout);
     cudaDeviceSynchronize();
 
-    bounce_back<<<threadSizingAll, NUMDIR>>>(d_obstacle, d_fin, d_fout);
+    bounce_back<<<blockSizingAll, threadSizingAllDIR>>>(d_obstacle, d_fin,
+                                                        d_fout);
     cudaDeviceSynchronize();
 
-    streaming<<<threadSizingAll, NUMDIR>>>(d_fout, d_fin);
+    streaming<<<blockSizingAll, threadSizingAllDIR>>>(d_fout, d_fin);
     cudaDeviceSynchronize();
 
     if (i % printInterval == 0) {
       writeToFile("output", i, d_u, h_u, h_nx, h_ny);
     }
   }
+  writeToFile("output", 0, d_u, h_u, h_nx, h_ny);
 
   return 0;
 }
 
 __global__ void setRhoTo1f(float *rho) {
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
-  rho[nx * y + x] = 1.0;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x < nx && y < ny) {
+    rho[nx * y + x] = 1.0;
+  }
 }
 
 __global__ void obstacle_mask(bool *obstacle) {
   // define the shape of the obstacle by creating a boolean mask
-
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
-  obstacle[nx * y + x] = ((x - cx) * (x - cx) + (y - cy) * (y - cy)) < (r * r);
-}
-
-__global__ void macroscopic(float *fin, float *rho, float *u) {
-
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
-  rho[nx * y + x] = 0;
-  u[(nx * y + x) * NUMDIM + 0] = 0;
-  u[(nx * y + x) * NUMDIM + 1] = 0;
-
-  for (int i = 0; i < NUMDIR; ++i) {
-    rho[nx * y + x] += fin[(nx * y + x) * NUMDIR + i];
-    u[(nx * y + x) * NUMDIM + 0] +=
-        d_v[i * NUMDIM + 0] * fin[(nx * y + x) * NUMDIR + i];
-    u[(nx * y + x) * NUMDIM + 1] +=
-        d_v[i * NUMDIM + 1] * fin[(nx * y + x) * NUMDIR + i];
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x < nx && y < ny) {
+    obstacle[nx * y + x] =
+        ((x - cx) * (x - cx) + (y - cy) * (y - cy)) < (r * r);
   }
+}
+__global__ void macroscopic(float *fin, float *rho, float *u) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x < nx && y < ny) {
+    rho[nx * y + x] = 0;
+    u[(nx * y + x) * NUMDIM + 0] = 0;
+    u[(nx * y + x) * NUMDIM + 1] = 0;
 
-  u[(nx * y + x) * NUMDIM + 0] /= rho[nx * y + x];
-  u[(nx * y + x) * NUMDIM + 1] /= rho[nx * y + x];
+    for (int i = 0; i < NUMDIR; ++i) {
+      rho[nx * y + x] += fin[(nx * y + x) * NUMDIR + i];
+      u[(nx * y + x) * NUMDIM + 0] +=
+          d_v[i * NUMDIM + 0] * fin[(nx * y + x) * NUMDIR + i];
+      u[(nx * y + x) * NUMDIM + 1] +=
+          d_v[i * NUMDIM + 1] * fin[(nx * y + x) * NUMDIR + i];
+    }
+
+    u[(nx * y + x) * NUMDIM + 0] /= rho[nx * y + x];
+    u[(nx * y + x) * NUMDIM + 1] /= rho[nx * y + x];
+  }
 }
 
 __global__ void equilibrium(float *rho, float *u, float *feq) {
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x < nx && y < ny) {
+    const float _rho = rho[nx * y + x];
+    const float _u0 = u[(nx * y + x) * NUMDIM + 0];
+    const float _u1 = u[(nx * y + x) * NUMDIM + 1];
+    const float usqr = 1.5 * (_u0 * _u0 + _u1 * _u1);
 
-  const float _rho = rho[nx * y + x];
-  const float _u0 = u[(nx * y + x) * NUMDIM + 0];
-  const float _u1 = u[(nx * y + x) * NUMDIM + 1];
-  const float usqr = 1.5 * (_u0 * _u0 + _u1 * _u1);
-
-  for (int i = 0; i < NUMDIR; ++i) {
-    const float cu =
-        3 * (d_v[i * NUMDIM + 0] * _u0 + d_v[i * NUMDIM + 1] * _u1);
-    feq[(nx * y + x) * NUMDIR + i] =
-        _rho * d_t[i] * (1 + cu + 0.5 * cu * cu - usqr);
+    for (int i = 0; i < NUMDIR; ++i) {
+      const float cu =
+          3 * (d_v[i * NUMDIM + 0] * _u0 + d_v[i * NUMDIM + 1] * _u1);
+      feq[(nx * y + x) * NUMDIR + i] =
+          _rho * d_t[i] * (1 + cu + 0.5 * cu * cu - usqr);
+    }
   }
 }
+
 __global__ void right_wall_outflow(float *fin) {
   const int x = nx - 1;
-  const int y = blockIdx.y;
-  const int i = col3[threadIdx.x];
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int i = col3[threadIdx.z];
 
-  fin[(nx * y + x) * NUMDIR + i] = fin[(nx * y + x - 1) * NUMDIR + i];
+  if (x < nx && y < ny) {
+    fin[(nx * y + x) * NUMDIR + i] = fin[(nx * y + x - 1) * NUMDIR + i];
+  }
 }
+
 __global__ void set_nxy(int h_nx, int h_ny, float h_Re) {
   Re = h_Re;
   nx = h_nx;
@@ -176,77 +193,91 @@ __global__ void set_nxy(int h_nx, int h_ny, float h_Re) {
 }
 
 __global__ void inivel(float *u) {
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
-  const int i = threadIdx.x;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int i = threadIdx.z;
 
-  u[(nx * y + x) * NUMDIM + i] =
-      (1 - i) * uLB * (1 + 1e-4 * sin(1. * y / ly * 2.0 * PI));
+  if (x < nx && y < ny) {
+    u[(nx * y + x) * NUMDIM + i] =
+        (1 - i) * uLB * (1 + 1e-4 * sin(1. * y / ly * 2.0 * PI));
+  }
 }
 
 __global__ void left_wall_inflow(float *fin, float *rho, float *u) {
   const int x = 0;
-  const int y = blockIdx.y;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-  const float _u0 = uLB * (1 + 1e-4 * sin(1.0 * y / ly * 2 * PI));
-  const float fincol2 = fin[(nx * y + x) * NUMDIR + col2[0]] +
-                        fin[(nx * y + x) * NUMDIR + col2[1]] +
-                        fin[(nx * y + x) * NUMDIR + col2[2]];
-  const float fincol3 = fin[(nx * y + x) * NUMDIR + col3[0]] +
-                        fin[(nx * y + x) * NUMDIR + col3[1]] +
-                        fin[(nx * y + x) * NUMDIR + col3[2]];
+  if (x < nx && y < ny) {
+    const float _u0 = uLB * (1 + 1e-4 * sin(1.0 * y / ly * 2 * PI));
+    const float fincol2 = fin[(nx * y + x) * NUMDIR + col2[0]] +
+                          fin[(nx * y + x) * NUMDIR + col2[1]] +
+                          fin[(nx * y + x) * NUMDIR + col2[2]];
+    const float fincol3 = fin[(nx * y + x) * NUMDIR + col3[0]] +
+                          fin[(nx * y + x) * NUMDIR + col3[1]] +
+                          fin[(nx * y + x) * NUMDIR + col3[2]];
 
-  u[(nx * y + x) * NUMDIM + 0] = _u0;
-  u[(nx * y + x) * NUMDIM + 1] = 0;
-  rho[nx * y + x] = 1.0 / (1 - _u0) * (fincol2 + 2 * fincol3);
+    u[(nx * y + x) * NUMDIM + 0] = _u0;
+    u[(nx * y + x) * NUMDIM + 1] = 0;
+    rho[nx * y + x] = 1.0 / (1 - _u0) * (fincol2 + 2 * fincol3);
+  }
 }
+
 __global__ void equilibrium_to_fin(float *feq, float *fin) {
   const int x = 0;
-  const int y = blockIdx.y;
-  const int i = threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int i = threadIdx.z;
 
-  fin[(nx * y + x) * NUMDIR + col1[i]] =
-      feq[(nx * y + x) * NUMDIR + col1[i]] +
-      fin[(nx * y + x) * NUMDIR + col3[2 - i]] -
-      feq[(nx * y + x) * NUMDIR + col3[2 - i]];
+  if (x < nx && y < ny) {
+    fin[(nx * y + x) * NUMDIR + col1[i]] =
+        feq[(nx * y + x) * NUMDIR + col1[i]] +
+        fin[(nx * y + x) * NUMDIR + col3[2 - i]] -
+        feq[(nx * y + x) * NUMDIR + col3[2 - i]];
+  }
 }
-__global__ void collision(float *fin, float *feq, float *fout) {
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
-  const int i = threadIdx.x;
-  const int idx = (nx * y + x) * NUMDIR + i;
 
-  fout[idx] = fin[idx] - omega * (fin[idx] - feq[idx]);
+__global__ void collision(float *fin, float *feq, float *fout) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int i = threadIdx.z;
+  if (x < nx && y < ny) {
+    const int idx = (nx * y + x) * NUMDIR + i;
+
+    fout[idx] = fin[idx] - omega * (fin[idx] - feq[idx]);
+  }
 }
 
 __global__ void bounce_back(bool *obstacle, float *fin, float *fout) {
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
-  const int i = threadIdx.x;
-  const int idx = nx * y + x;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int i = threadIdx.z;
+  if (x < nx && y < ny) {
+    const int idx = nx * y + x;
 
-  if (obstacle[idx]) {
-    fout[idx * NUMDIR + i] = fin[idx * NUMDIR + 8 - i];
+    if (obstacle[idx]) {
+      fout[idx * NUMDIR + i] = fin[idx * NUMDIR + 8 - i];
+    }
   }
 }
 
 __global__ void streaming(float *fout, float *fin) {
-  const int x = blockIdx.x;
-  const int y = blockIdx.y;
-  const int i = threadIdx.x;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int i = threadIdx.z;
 
-  int next_x = x + d_v[NUMDIM * i + 0];
-  next_x = (next_x < 0) ? (nx - 1) : next_x;
-  next_x = (next_x >= nx) ? 0 : next_x;
+  if (x < nx && y < ny) {
+    int next_x = x + d_v[NUMDIM * i + 0];
+    next_x = (next_x < 0) ? (nx - 1) : next_x;
+    next_x = (next_x >= nx) ? 0 : next_x;
 
-  int next_y = y + d_v[NUMDIM * i + 1];
-  next_y = (next_y < 0) ? (ny - 1) : next_y;
-  next_y = (next_y >= ny) ? 0 : next_y;
+    int next_y = y + d_v[NUMDIM * i + 1];
+    next_y = (next_y < 0) ? (ny - 1) : next_y;
+    next_y = (next_y >= ny) ? 0 : next_y;
 
-  const int idx = (nx * y + x) * NUMDIR + i;
-  const int next_idx = (nx * next_y + next_x) * NUMDIR + i;
+    const int idx = (nx * y + x) * NUMDIR + i;
+    const int next_idx = (nx * next_y + next_x) * NUMDIR + i;
 
-  fin[next_idx] = fout[idx];
+    fin[next_idx] = fout[idx];
+  }
 }
 
 __host__ void writeToFile(std::string_view baseName, int number,
